@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"strconv"
 	"strings"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -23,6 +24,16 @@ const (
 // requested in a question (RFC 6762 clauses 10.2 and 5.4).
 const topBit = 0x8000
 
+// typeNSEC is the NSEC record type (RFC 4034 clause 4), which multicast
+// DNS uses in a restricted form for negative answers (RFC 6762 clause 6.1).
+const typeNSEC dnsmessage.Type = 47
+
+// maxPacket is the largest multicast packet built in one piece; longer
+// queries carry their known answers on in further packets (RFC 6762
+// clause 7.2) and longer responses are split (clause 17 keeps multicast
+// packets within the link's MTU).
+const maxPacket = 1400
+
 // rr is one resource record in a form both sides can compare.
 type rr struct {
 	Name  string // fully qualified, trailing dot
@@ -37,7 +48,19 @@ type rr struct {
 	Weight uint16   // SRV weight
 	TXT    []string // TXT strings
 	IP     net.IP   // A or AAAA
+	// Types are the record types an NSEC record says exist for its name;
+	// every other type does not (RFC 6762 clause 6.1).
+	Types []dnsmessage.Type
 }
+
+// key identifies a record by name, type and data, for rate limits and
+// duplicate suppression.
+func (r rr) key() string {
+	return strings.ToLower(r.Name) + "\x00" + strconv.Itoa(int(r.Type)) + "\x00" + string(r.rdata())
+}
+
+// has reports whether an NSEC record lists t.
+func (r rr) has(t dnsmessage.Type) bool { return slices.Contains(r.Types, t) }
 
 // sameData reports whether two records have the same name, type and data.
 func (r rr) sameData(o rr) bool {
@@ -53,8 +76,16 @@ func (r rr) sameData(o rr) bool {
 		return slices.Equal(r.TXT, o.TXT)
 	case dnsmessage.TypeA, dnsmessage.TypeAAAA:
 		return r.IP.Equal(o.IP)
+	case typeNSEC:
+		return slices.Equal(sortedTypes(r.Types), sortedTypes(o.Types))
 	}
 	return false
+}
+
+func sortedTypes(ts []dnsmessage.Type) []dnsmessage.Type {
+	out := slices.Clone(ts)
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 func mustName(s string) (dnsmessage.Name, error) {
@@ -99,6 +130,10 @@ func addRR(b *dnsmessage.Builder, r rr) error {
 		var a [16]byte
 		copy(a[:], r.IP.To16())
 		return b.AAAAResource(h, dnsmessage.AAAAResource{AAAA: a})
+	case typeNSEC:
+		// The next-domain name is written out, not compressed (RFC 6762
+		// clause 18.14).
+		return b.UnknownResource(h, dnsmessage.UnknownResource{Type: typeNSEC, Data: r.rdata()})
 	}
 	return fmt.Errorf("mdns: cannot pack record type %v", r.Type)
 }
@@ -196,10 +231,141 @@ func fromResource(res dnsmessage.Resource) (rr, bool) {
 		r.IP = net.IP(slices.Clone(b.A[:]))
 	case *dnsmessage.AAAAResource:
 		r.IP = net.IP(slices.Clone(b.AAAA[:]))
+	case *dnsmessage.UnknownResource:
+		if b.Type != typeNSEC {
+			return r, false
+		}
+		types, ok := nsecTypes(b.Data)
+		if !ok {
+			return r, false
+		}
+		r.Type, r.Types = typeNSEC, types
 	default:
 		return r, false
 	}
 	return r, true
+}
+
+// nsecTypes reads the type bitmaps of NSEC rdata (RFC 4034 clause 4.1.2),
+// skipping the next-domain name, which multicast DNS sets to the record's
+// own name (RFC 6762 clause 6.1) and which may arrive compressed.
+func nsecTypes(d []byte) ([]dnsmessage.Type, bool) {
+	i := 0
+	for {
+		if i >= len(d) {
+			return nil, false
+		}
+		l := int(d[i])
+		if l == 0 {
+			i++
+			break
+		}
+		if l&0xC0 == 0xC0 {
+			i += 2
+			break
+		}
+		if l&0xC0 != 0 {
+			return nil, false
+		}
+		i += 1 + l
+	}
+	var out []dnsmessage.Type
+	for i < len(d) {
+		if i+2 > len(d) {
+			return nil, false
+		}
+		win, n := int(d[i]), int(d[i+1])
+		if n < 1 || n > 32 || i+2+n > len(d) {
+			return nil, false
+		}
+		for j, b := range d[i+2 : i+2+n] {
+			for k := 0; k < 8; k++ {
+				if b&(0x80>>k) != 0 {
+					out = append(out, dnsmessage.Type(win*256+j*8+k))
+				}
+			}
+		}
+		i += 2 + n
+	}
+	return out, true
+}
+
+// packQuery builds a query with its known answers. When the known answers
+// do not fit in limit bytes, the first packet holds the questions and as
+// many known answers as fit, the rest follow in packets with no questions,
+// and every packet but the last has the TC bit set (RFC 6762 clause 7.2).
+func packQuery(qs []dnsmessage.Question, known []rr, limit int) ([][]byte, error) {
+	cur := message{Questions: qs}
+	var out [][]byte
+	for _, k := range known {
+		try := cur
+		try.Answers = append(slices.Clip(cur.Answers), k)
+		b, err := try.pack()
+		if err != nil {
+			return nil, err
+		}
+		if len(b) > limit && len(cur.Answers) > 0 {
+			cur.Header.Truncated = true
+			p, err := cur.pack()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, p)
+			cur = message{Answers: []rr{k}}
+			continue
+		}
+		cur = try
+	}
+	p, err := cur.pack()
+	if err != nil {
+		return nil, err
+	}
+	return append(out, p), nil
+}
+
+// packResponse builds a response in packets of at most limit bytes: the
+// answers in order, as many per packet as fit, and the additional records
+// in the last packet while they fit (they are optional).
+func packResponse(h dnsmessage.Header, ans, add []rr, limit int) ([][]byte, error) {
+	cur := message{Header: h}
+	var out [][]byte
+	for _, a := range ans {
+		try := cur
+		try.Answers = append(slices.Clip(cur.Answers), a)
+		b, err := try.pack()
+		if err != nil {
+			return nil, err
+		}
+		if len(b) > limit && len(cur.Answers) > 0 {
+			p, err := cur.pack()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, p)
+			cur = message{Header: h, Answers: []rr{a}}
+			continue
+		}
+		cur = try
+	}
+	for _, a := range add {
+		try := cur
+		try.Additionals = append(slices.Clip(cur.Additionals), a)
+		b, err := try.pack()
+		if err != nil {
+			return nil, err
+		}
+		if len(b) <= limit {
+			cur = try
+		}
+	}
+	if len(cur.Answers) == 0 && len(cur.Additionals) == 0 && len(out) > 0 {
+		return out, nil
+	}
+	p, err := cur.pack()
+	if err != nil {
+		return nil, err
+	}
+	return append(out, p), nil
 }
 
 // question builds a question; unicast sets the QU bit.
@@ -244,6 +410,29 @@ func (r rr) rdata() []byte {
 		b = append(b, r.IP.To4()...)
 	case dnsmessage.TypeAAAA:
 		b = append(b, r.IP.To16()...)
+	case typeNSEC:
+		name(r.Name)
+		b = append(b, nsecBitmap(r.Types)...)
+	}
+	return b
+}
+
+// nsecBitmap encodes types as NSEC type bitmaps, one window per 256 types.
+func nsecBitmap(types []dnsmessage.Type) []byte {
+	var b []byte
+	ts := sortedTypes(types)
+	for len(ts) > 0 {
+		win := int(ts[0]) / 256
+		var bits [32]byte
+		n := 0
+		for len(ts) > 0 && int(ts[0])/256 == win {
+			lo := int(ts[0]) % 256
+			bits[lo/8] |= 0x80 >> (lo % 8)
+			n = lo/8 + 1
+			ts = ts[1:]
+		}
+		b = append(b, byte(win), byte(n))
+		b = append(b, bits[:n]...)
 	}
 	return b
 }

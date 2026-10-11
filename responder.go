@@ -2,6 +2,7 @@ package mdns
 
 import (
 	"bytes"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -55,6 +56,28 @@ func newResponder(s Service, service string) (*responder, error) {
 	}
 	r.allIPs = append(r.allIPs, r.fixedIPs...)
 	return r, nil
+}
+
+// renamed is a responder for s (the same service under a new instance or
+// host name) that keeps the addresses learned from the interfaces.
+func (r *responder) renamed(s Service, service string) (*responder, error) {
+	nr, err := newResponder(s, service)
+	if err != nil {
+		return nil, err
+	}
+	if len(nr.fixedIPs) > 0 {
+		return nr, nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for idx, list := range r.ifIPs {
+		var ips [][]byte
+		for _, x := range list {
+			ips = append(ips, x.IP)
+		}
+		nr.setInterfaceAddrs(idx, ips)
+	}
+	return nr, nil
 }
 
 func (r *responder) addrRR(ip []byte) rr {
@@ -185,6 +208,27 @@ func (r *responder) answer(qs []dnsmessage.Question, known []rr, ifIndex int) (a
 		}
 		return false
 	}
+	addrs := r.addrs(ifIndex)
+	// The negative answers for our two unique names (RFC 6762 clause
+	// 6.1): the instance has SRV and TXT, the host the address types it
+	// has on this interface. No NSEC is made for a host with no address.
+	var hostTypes []dnsmessage.Type
+	for _, a := range addrs {
+		if !slices.Contains(hostTypes, a.Type) {
+			hostTypes = append(hostTypes, a.Type)
+		}
+	}
+	nsecHost := rr{Name: r.hostName, Type: typeNSEC, TTL: ttlHost, Flush: true, Types: hostTypes}
+	nsecInst := rr{Name: r.instName, Type: typeNSEC, TTL: ttlHost, Flush: true, Types: []dnsmessage.Type{dnsmessage.TypeTXT, dnsmessage.TypeSRV}}
+	// withAddrs adds the host's addresses as additional records and, when
+	// one address family is missing, the NSEC that says so (clause 6.2).
+	withAddrs := func() {
+		add = append(add, addrs...)
+		if len(hostTypes) == 1 {
+			add = append(add, nsecHost)
+		}
+	}
+	named := func(q dnsmessage.Question, name string) bool { return strings.EqualFold(q.Name.String(), name) }
 	for _, q := range qs {
 		if dnsmessage.Class(uint16(q.Class)&^topBit) != dnsmessage.ClassINET && q.Class != dnsmessage.ClassANY {
 			continue
@@ -195,26 +239,38 @@ func (r *responder) answer(qs []dnsmessage.Question, known []rr, ifIndex int) (a
 		if is(q, r.typeName, dnsmessage.TypePTR) {
 			ans = append(ans, r.ptr())
 			add = append(add, r.srv(), r.txtRR())
-			add = append(add, r.addrs(ifIndex)...)
+			withAddrs()
 		}
 		for _, sp := range r.subPTRs() {
 			if is(q, sp.Name, dnsmessage.TypePTR) {
 				ans = append(ans, sp)
 				add = append(add, r.srv(), r.txtRR())
-				add = append(add, r.addrs(ifIndex)...)
+				withAddrs()
 			}
 		}
 		if is(q, r.instName, dnsmessage.TypeSRV) {
 			ans = append(ans, r.srv())
-			add = append(add, r.addrs(ifIndex)...)
+			withAddrs()
 		}
 		if is(q, r.instName, dnsmessage.TypeTXT) {
 			ans = append(ans, r.txtRR())
 		}
-		for _, a := range r.addrs(ifIndex) {
+		if named(q, r.instName) && q.Type != dnsmessage.TypeALL && q.Type != dnsmessage.TypeSRV && q.Type != dnsmessage.TypeTXT {
+			ans = append(ans, nsecInst)
+		}
+		answered := false
+		for _, a := range addrs {
 			if is(q, r.hostName, a.Type) {
 				ans = append(ans, a)
+				answered = true
 			}
+		}
+		if answered && q.Type != dnsmessage.TypeALL {
+			// The other family as additional records, or its absence.
+			withAddrs()
+		}
+		if named(q, r.hostName) && !answered && len(hostTypes) > 0 {
+			ans = append(ans, nsecHost)
 		}
 	}
 	keep := func(list []rr, drop []rr) []rr {

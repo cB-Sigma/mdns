@@ -18,9 +18,10 @@ import (
 var queryAt = []time.Duration{0, time.Second, 3 * time.Second, 7 * time.Second}
 
 // maxQuery is the largest query packet sent in one piece; a query for many
-// types with many known answers is split per type above it (RFC 6762
-// clause 17 keeps multicast packets within the link's MTU).
-const maxQuery = 1400
+// types with many known answers is split per type above it, and a type's
+// known answers go on in further packets with the TC bit (RFC 6762
+// clauses 7.2 and 17).
+const maxQuery = maxPacket
 
 // Browse looks for instances of service (for example "_matter._tcp" or a
 // subtype such as "_L840._sub._matterc._udp") and returns what answered
@@ -65,9 +66,9 @@ func BrowseTypes(ctx context.Context, services []string, opts Options) (map[stri
 		defer cancel()
 	}
 	c := newCache()
-	q, err := newQuerier(ctx, opts, ifaces, func(m message, ifIndex int) {
-		c.addFor(m, ifIndex, time.Now(), names)
-	})
+	q, err := newQuerier(ctx, opts, ifaces, func(m message, ifIndex int, mc bool) {
+		c.addFor(m, ifIndex, time.Now(), names, mc)
+	}, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -140,6 +141,22 @@ type cached struct {
 	// its TTL).
 	refreshed int
 	jitter    float64
+	// mcast is set when the record was heard by multicast, so its owner
+	// answers others by multicast and its silence means something (RFC
+	// 6762 clause 10.5); records only ever heard in unicast replies are
+	// not judged by what others' queries get.
+	mcast bool
+	// poofCount counts queries from other hosts that asked for the record
+	// without listing it as known since it was last received, and
+	// poofFirst is when the first came (RFC 6762 clause 10.5).
+	poofCount int
+	poofFirst time.Time
+	// reconfirm, when set, is when the record is dropped unless it is
+	// received again (RFC 6762 clause 10.4).
+	reconfirm time.Time
+	// goodbye is set for a record whose goodbye arrived; it lives one
+	// more second (RFC 6762 clause 10.1).
+	goodbye bool
 }
 
 type want struct {
@@ -161,14 +178,16 @@ func (c *cache) add(m message, now time.Time) { c.addOn(m, 0, now) }
 func (c *cache) addOn(m message, ifIndex int, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.store(append(append([]rr(nil), m.Answers...), m.Additionals...), ifIndex, now)
+	c.store(append(append([]rr(nil), m.Answers...), m.Additionals...), ifIndex, now, true)
 }
 
 // addFor is addOn keeping only the records that belong to the browsed
 // types: their PTR records, the SRV and TXT records of the instances they
-// name, and the addresses of the SRV targets. Listening on the mDNS port
-// hears every response on the link; the rest is not kept.
-func (c *cache) addFor(m message, ifIndex int, now time.Time, typeNames []string) {
+// name, and the addresses and NSEC records of the SRV targets (and the
+// instances' NSEC records). Listening on the mDNS port hears every
+// response on the link; the rest is not kept. mcast says the response
+// came by multicast.
+func (c *cache) addFor(m message, ifIndex int, now time.Time, typeNames []string, mcast bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	incoming := append(append([]rr(nil), m.Answers...), m.Additionals...)
@@ -213,38 +232,147 @@ func (c *cache) addFor(m message, ifIndex int, now time.Time, typeNames []string
 			if hosts[n] {
 				keep = append(keep, x)
 			}
+		case typeNSEC:
+			if insts[n] || hosts[n] {
+				keep = append(keep, x)
+			}
 		}
 	}
-	c.store(keep, ifIndex, now)
+	c.store(keep, ifIndex, now, mcast)
 }
 
+// flushAge is how old a record must be before a cache-flush record of the
+// same name and type removes it: records received within the last second
+// belong to the same announcement, which may span packets (RFC 6762
+// clause 10.2).
+const flushAge = time.Second
+
 // store adds records; the caller holds mu.
-func (c *cache) store(incoming []rr, ifIndex int, now time.Time) {
+func (c *cache) store(incoming []rr, ifIndex int, now time.Time, mcast bool) {
 	flushed := map[want]bool{}
+	sameIf := func(e cached) bool { return ifIndex == 0 || e.ifIndex == 0 || e.ifIndex == ifIndex }
 	for _, x := range incoming {
 		key := want{strings.ToLower(x.Name), x.Type}
 		if x.Flush && x.TTL > 0 && !flushed[key] {
 			flushed[key] = true
 			c.drop(func(e cached) bool {
-				return (ifIndex == 0 || e.ifIndex == 0 || e.ifIndex == ifIndex) && strings.EqualFold(e.r.Name, x.Name) && e.r.Type == x.Type
+				return sameIf(e) && strings.EqualFold(e.r.Name, x.Name) && e.r.Type == x.Type && now.Sub(e.received) >= flushAge && !e.r.sameData(x)
 			})
+		}
+		if x.Type == typeNSEC && x.TTL > 0 {
+			// An NSEC record says the types it does not list do not exist
+			// for its name (RFC 6762 clause 6.1).
+			c.drop(func(e cached) bool {
+				return sameIf(e) && strings.EqualFold(e.r.Name, x.Name) && e.r.Type != typeNSEC && !x.has(e.r.Type) && now.Sub(e.received) >= flushAge
+			})
+		}
+		if x.TTL == 0 {
+			// A goodbye: the record lives one more second, so a fresh
+			// copy from another responder can still replace it (RFC 6762
+			// clause 10.1).
+			for i := range c.entries {
+				e := &c.entries[i]
+				if e.r.sameData(x) && e.expires.After(now.Add(time.Second)) {
+					e.expires, e.goodbye = now.Add(time.Second), true
+				}
+			}
+			continue
 		}
 		expires := now.Add(time.Duration(x.TTL) * time.Second)
 		// The same record heard again (by multicast and in a legacy
 		// unicast reply, whose TTL is capped at 10 s) keeps the later
-		// expiry; a goodbye removes it.
+		// expiry.
+		heard := mcast
 		for _, e := range c.entries {
-			if x.TTL > 0 && e.r.sameData(x) && e.expires.After(expires) {
-				expires = e.expires
+			if e.r.sameData(x) && !e.goodbye {
+				if e.expires.After(expires) {
+					expires = e.expires
+				}
+				heard = heard || e.mcast
 			}
 		}
 		c.drop(func(e cached) bool { return e.r.sameData(x) })
-		if x.TTL == 0 {
+		x.TTL = uint32(expires.Sub(now) / time.Second)
+		c.entries = append(c.entries, cached{r: x, received: now, expires: expires, ifIndex: ifIndex, jitter: rand.Float64() * 0.02, mcast: heard})
+	}
+}
+
+// negativeLocked reports whether a live NSEC record says name has no
+// record of type t; the caller holds mu.
+func (c *cache) negativeLocked(name string, t dnsmessage.Type, now time.Time) bool {
+	for _, n := range c.live(now, name, typeNSEC) {
+		if !n.has(t) {
+			return true
+		}
+	}
+	return false
+}
+
+// observeQuery notes a query another host sent by multicast and that
+// expects multicast answers: each cached record it asks for without
+// listing it as known counts towards passive observation of failures
+// (RFC 6762 clause 10.5).
+func (c *cache) observeQuery(m message, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, q := range m.Questions {
+		if uint16(q.Class)&topBit != 0 {
 			continue
 		}
-		x.TTL = uint32(expires.Sub(now) / time.Second)
-		c.entries = append(c.entries, cached{r: x, received: now, expires: expires, ifIndex: ifIndex, jitter: rand.Float64() * 0.02})
+		name := q.Name.String()
+	next:
+		for i := range c.entries {
+			e := &c.entries[i]
+			if !e.mcast || e.goodbye || !strings.EqualFold(e.r.Name, name) || (q.Type != dnsmessage.TypeALL && q.Type != e.r.Type) || !e.expires.After(now) {
+				continue
+			}
+			for _, k := range m.Answers {
+				if k.sameData(e.r) {
+					continue next
+				}
+			}
+			if e.poofCount == 0 {
+				e.poofFirst = now
+			}
+			e.poofCount++
+		}
 	}
+}
+
+// poofWindow is how long records asked for at least twice may stay
+// unanswered before they are dropped (RFC 6762 clause 10.5).
+var poofWindow = 10 * time.Second
+
+// expireSilent drops the records that went unanswered after two or more
+// queries for poofWindow, and those whose reconfirmation ran out.
+func (c *cache) expireSilent(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.drop(func(e cached) bool {
+		return (e.poofCount >= 2 && now.Sub(e.poofFirst) >= poofWindow) || (!e.reconfirm.IsZero() && !now.Before(e.reconfirm))
+	})
+}
+
+// markReconfirm sets the reconfirmation deadline of the records that
+// match and returns what to ask for them.
+func (c *cache) markReconfirm(match func(rr) bool, deadline time.Time) []want {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []want
+	seen := map[want]bool{}
+	for i := range c.entries {
+		e := &c.entries[i]
+		if e.r.Type == typeNSEC || !match(e.r) {
+			continue
+		}
+		e.reconfirm = deadline
+		k := want{e.r.Name, e.r.Type}
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 func (c *cache) drop(match func(cached) bool) {
@@ -264,14 +392,22 @@ func (c *cache) purge(now time.Time) {
 	c.drop(func(e cached) bool { return !e.expires.After(now) })
 }
 
+// live returns the unexpired records of a name and type, the most recently
+// received first (within a second of a cache flush the old copy is still
+// there, and the new one is the one to use).
 func (c *cache) live(now time.Time, name string, t dnsmessage.Type) []rr {
-	var out []rr
+	var es []cached
 	for _, e := range c.entries {
 		if e.expires.After(now) && e.r.Type == t && strings.EqualFold(e.r.Name, name) {
-			r := e.r
-			r.TTL = uint32(e.expires.Sub(now) / time.Second)
-			out = append(out, r)
+			es = append(es, e)
 		}
+	}
+	sort.SliceStable(es, func(i, j int) bool { return es[i].received.After(es[j].received) })
+	out := make([]rr, 0, len(es))
+	for _, e := range es {
+		r := e.r
+		r.TTL = uint32(e.expires.Sub(now) / time.Second)
+		out = append(out, r)
 	}
 	return out
 }
@@ -285,38 +421,72 @@ func (c *cache) pending(typeName string, now time.Time) (known []rr, missing []w
 }
 
 func (c *cache) pendingLocked(typeName string, now time.Time) (known []rr, missing []want) {
-	for _, p := range c.live(now, typeName, dnsmessage.TypePTR) {
+	for _, p := range c.knownLocked(now, typeName, dnsmessage.TypePTR, false) {
 		srv := c.live(now, p.PTR, dnsmessage.TypeSRV)
 		txt := c.live(now, p.PTR, dnsmessage.TypeTXT)
-		complete := len(srv) > 0 && len(txt) > 0
-		if len(srv) == 0 {
+		// An NSEC answer that the instance has no TXT (or no SRV) ends
+		// the questions for it (RFC 6762 clause 6.1).
+		noTXT := len(txt) == 0 && c.negativeLocked(p.PTR, dnsmessage.TypeTXT, now)
+		complete := len(srv) > 0 && (len(txt) > 0 || noTXT)
+		if len(srv) == 0 && !c.negativeLocked(p.PTR, dnsmessage.TypeSRV, now) {
 			missing = append(missing, want{p.PTR, dnsmessage.TypeSRV})
 		}
-		if len(txt) == 0 {
+		if len(txt) == 0 && !noTXT {
 			missing = append(missing, want{p.PTR, dnsmessage.TypeTXT})
 		}
 		if len(srv) > 0 && len(c.live(now, srv[0].Target, dnsmessage.TypeA))+len(c.live(now, srv[0].Target, dnsmessage.TypeAAAA)) == 0 {
-			complete = false
-			missing = append(missing, want{srv[0].Target, dnsmessage.TypeA}, want{srv[0].Target, dnsmessage.TypeAAAA})
+			for _, t := range []dnsmessage.Type{dnsmessage.TypeA, dnsmessage.TypeAAAA} {
+				if !c.negativeLocked(srv[0].Target, t, now) {
+					complete = false
+					missing = append(missing, want{srv[0].Target, t})
+				}
+			}
 		}
-		if complete {
+		// A known answer must still have half its TTL (RFC 6762 clause
+		// 7.1); one with less is asked for again.
+		if complete && c.halfLife(p, now) {
 			known = append(known, p)
 		}
 	}
 	return known, missing
 }
 
+// knownLocked is live, optionally keeping only the records that have at
+// least half their TTL left.
+func (c *cache) knownLocked(now time.Time, name string, t dnsmessage.Type, half bool) []rr {
+	var out []rr
+	for _, e := range c.entries {
+		if e.expires.After(now) && e.r.Type == t && strings.EqualFold(e.r.Name, name) && (!half || 2*e.expires.Sub(now) >= e.expires.Sub(e.received)) {
+			r := e.r
+			r.TTL = uint32(e.expires.Sub(now) / time.Second)
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// halfLife reports whether the cached copy of r has half its TTL left.
+func (c *cache) halfLife(r rr, now time.Time) bool {
+	for _, e := range c.entries {
+		if e.r.sameData(r) && e.expires.After(now) {
+			return !e.goodbye && 2*e.expires.Sub(now) >= e.expires.Sub(e.received)
+		}
+	}
+	return false
+}
+
 // queries builds the next query for the types: a PTR question for each
 // with the complete instances as known answers, plus direct questions for
 // records still missing. It is one packet unless that would exceed
-// maxQuery, then one per type.
+// maxQuery, then one per type; a type whose known answers do not fit in
+// one packet sends them on in more, with the TC bit (RFC 6762 clause 7.2).
 func (c *cache) queries(typeNames []string, now time.Time) ([][]byte, error) {
-	build := func(types []string) ([]byte, error) {
+	build := func(types []string) (message, error) {
 		m := message{}
 		for _, t := range types {
 			q, err := question(t, dnsmessage.TypePTR, false)
 			if err != nil {
-				return nil, err
+				return m, err
 			}
 			m.Questions = append(m.Questions, q)
 			known, missing := c.pending(t, now)
@@ -327,19 +497,27 @@ func (c *cache) queries(typeNames []string, now time.Time) ([][]byte, error) {
 				}
 			}
 		}
-		return m.pack()
+		return m, nil
 	}
-	all, err := build(typeNames)
-	if err != nil || len(all) <= maxQuery || len(typeNames) == 1 {
+	m, err := build(typeNames)
+	if err != nil {
+		return nil, err
+	}
+	all, err := m.pack()
+	if err != nil || len(all) <= maxQuery {
 		return [][]byte{all}, err
 	}
 	var out [][]byte
 	for _, t := range typeNames {
-		p, err := build([]string{t})
+		m, err := build([]string{t})
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, p)
+		pkts, err := packQuery(m.Questions, m.Answers, maxQuery)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, pkts...)
 	}
 	return out, nil
 }
@@ -358,7 +536,7 @@ func (c *cache) due(typeNames []string, now time.Time) []want {
 	var out []want
 	for i := range c.entries {
 		e := &c.entries[i]
-		if e.refreshed >= 4 || !e.expires.After(now) {
+		if e.refreshed >= 4 || !e.expires.After(now) || e.goodbye || e.r.Type == typeNSEC {
 			continue
 		}
 		ttl := e.expires.Sub(e.received)

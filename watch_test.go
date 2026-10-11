@@ -83,7 +83,7 @@ func TestCacheKeepsOnlyBrowsedRecords(t *testing.T) {
 		}
 		return m
 	}
-	c.addFor(pkt(r, other), 0, now, []string{typeName})
+	c.addFor(pkt(r, other), 0, now, []string{typeName}, true)
 	for _, e := range c.entries {
 		if e.r.Name == other.typeName || e.r.Name == other.instName {
 			t.Fatalf("kept %v", e.r)
@@ -94,7 +94,7 @@ func TestCacheKeepsOnlyBrowsedRecords(t *testing.T) {
 	}
 	legacy := r.srv()
 	legacy.TTL, legacy.Flush = legacyTTL, false
-	c.addFor(message{Header: dnsmessage.Header{Response: true}, Answers: []rr{legacy}}, 0, now, []string{typeName})
+	c.addFor(message{Header: dnsmessage.Header{Response: true}, Answers: []rr{legacy}}, 0, now, []string{typeName}, false)
 	if got := c.services(typeName, now.Add(60*time.Second)); len(got) != 1 {
 		t.Fatalf("legacy copy shortened the SRV: %+v", got)
 	}

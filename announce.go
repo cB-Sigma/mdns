@@ -25,10 +25,27 @@ var (
 )
 
 // Announcer advertises one service until Close or until its context ends.
+//
+// After probing it keeps listening for conflicts (RFC 6762 clause 9): when
+// another responder answers with other data for the instance or host name,
+// it probes again and, if the name is taken, renames through
+// Options.Rename or stops answering; Options.OnConflict hears about each
+// step.
 type Announcer struct {
-	r    *responder
-	port int
-	opts Options
+	rp      atomic.Pointer[responder]
+	service string
+	port    int
+	opts    Options
+
+	// svcMu guards svc, the service as announced now (it changes on
+	// UpdateTXT and after a rename), and renames, the number of renames
+	// so far, which numbers the next one.
+	svcMu   sync.Mutex
+	svc     Service
+	renames int
+	// conflictAt are the times of recent confirmed conflicts, for the
+	// limit of RFC 6762 clause 8.1.
+	conflictAt []time.Time
 
 	c4, c6 net.PacketConn
 	p4     *ipv4.PacketConn
@@ -44,12 +61,26 @@ type Announcer struct {
 	// lostTie is set when another host probing for one of our names at
 	// the same time wins the tie-break (RFC 6762 clause 8.2).
 	lostTie atomic.Bool
+	// reprobing is set while a conflict seen after probing is handled;
+	// withdrawn once the announcer has given its names up.
+	reprobing atomic.Bool
+	withdrawn atomic.Bool
+	errMu     sync.Mutex
+	err       error
 
+	out outbox
+	ka  knownAnswerWait
+
+	ctx       context.Context
+	cancel    context.CancelFunc
 	done      chan struct{}
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 	closeErr  error
 }
+
+// r is the responder for the names in use now.
+func (a *Announcer) r() *responder { return a.rp.Load() }
 
 // Announce advertises s as an instance of service (for example
 // "_matter._tcp"). It joins
@@ -65,10 +96,15 @@ type Announcer struct {
 // When probing finds a conflict and opts.Rename is set, Announce asks it
 // for a new service (new instance and/or host name) and probes again, up
 // to MaxRenames times (RFC 6762 clause 9); otherwise it fails with
-// ErrConflict.
+// ErrConflict. When it succeeds under another name than s, it calls
+// opts.OnConflict with a ConflictRenamed event before returning.
 func Announce(ctx context.Context, s Service, service string, opts Options) (*Announcer, error) {
+	orig := s
 	for attempt := 1; ; attempt++ {
-		a, err := announce(ctx, s, service, opts)
+		a, err := announce(ctx, s, service, opts, attempt-1)
+		if err == nil && attempt > 1 && opts.OnConflict != nil {
+			opts.OnConflict(ConflictEvent{Kind: ConflictRenamed, Service: a.Service(), Previous: orig})
+		}
 		if err == nil || !errors.Is(err, ErrConflict) || opts.Rename == nil || attempt > MaxRenames {
 			return a, err
 		}
@@ -80,7 +116,7 @@ func Announce(ctx context.Context, s Service, service string, opts Options) (*An
 // limits a responder to 15 conflicts in 10 seconds).
 const MaxRenames = 15
 
-func announce(ctx context.Context, s Service, service string, opts Options) (*Announcer, error) {
+func announce(ctx context.Context, s Service, service string, opts Options, renames int) (*Announcer, error) {
 	r, err := newResponder(s, service)
 	if err != nil {
 		return nil, err
@@ -89,7 +125,10 @@ func announce(ctx context.Context, s Service, service string, opts Options) (*An
 	if err != nil {
 		return nil, err
 	}
-	a := &Announcer{r: r, port: opts.port(), opts: opts, done: make(chan struct{})}
+	a := &Announcer{service: service, port: opts.port(), opts: opts, svc: cloneService(s), renames: renames, done: make(chan struct{})}
+	a.rp.Store(r)
+	a.ctx, a.cancel = context.WithCancel(context.Background())
+	a.out.init()
 	lc := net.ListenConfig{Control: reuseControl}
 	var errs []error
 
@@ -107,7 +146,10 @@ func announce(ctx context.Context, s Service, service string, opts Options) (*An
 		if len(a.joined4) == 0 {
 			_ = c.Close()
 		} else {
-			_ = p.SetControlMessage(ipv4.FlagInterface, true)
+			// The destination tells a multicast query from one sent to
+			// our address, which must come from the local link (RFC 6762
+			// clause 11).
+			_ = p.SetControlMessage(ipv4.FlagInterface|ipv4.FlagDst, true)
 			_ = p.SetMulticastTTL(255)
 			if opts.Loopback {
 				_ = p.SetMulticastLoopback(true)
@@ -129,7 +171,7 @@ func announce(ctx context.Context, s Service, service string, opts Options) (*An
 		if len(a.joined6) == 0 {
 			_ = c.Close()
 		} else {
-			_ = p.SetControlMessage(ipv6.FlagInterface, true)
+			_ = p.SetControlMessage(ipv6.FlagInterface|ipv6.FlagDst, true)
 			_ = p.SetMulticastHopLimit(255)
 			if opts.Loopback {
 				_ = p.SetMulticastLoopback(true)
@@ -138,6 +180,7 @@ func announce(ctx context.Context, s Service, service string, opts Options) (*An
 		}
 	}
 	if a.p4 == nil && a.p6 == nil {
+		a.cancel()
 		return nil, fmt.Errorf("mdns: no multicast socket: %w", errors.Join(errs...))
 	}
 
@@ -177,6 +220,36 @@ func announce(ctx context.Context, s Service, service string, opts Options) (*An
 	return a, nil
 }
 
+func cloneService(s Service) Service {
+	if s.TXT != nil {
+		m := make(map[string]string, len(s.TXT))
+		for k, v := range s.TXT {
+			m[k] = v
+		}
+		s.TXT = m
+	}
+	s.IPs = append([]net.IP(nil), s.IPs...)
+	s.Subtypes = append([]string(nil), s.Subtypes...)
+	return s
+}
+
+// Service returns the service as announced now: after a rename it carries
+// the new instance or host name, after UpdateTXT the new metadata.
+func (a *Announcer) Service() Service {
+	a.svcMu.Lock()
+	defer a.svcMu.Unlock()
+	return cloneService(a.svc)
+}
+
+// Err returns nil while the announcer holds its names, and an error
+// wrapping ErrConflict once it has given them up after a conflict it could
+// not rename its way out of (no Options.Rename, or MaxRenames reached).
+func (a *Announcer) Err() error {
+	a.errMu.Lock()
+	defer a.errMu.Unlock()
+	return a.err
+}
+
 // probe sends the probes and waits for conflicting answers. When another
 // host probing for the same name at the same time wins the tie-break, it
 // waits one second and starts again (RFC 6762 clause 8.2), at most
@@ -192,13 +265,14 @@ func (a *Announcer) probe(ctx context.Context) error {
 			return ctx.Err()
 		case <-t.C:
 		}
+		r := a.r()
 		if a.conflict.Load() {
-			return fmt.Errorf("%w: %s or %s", ErrConflict, a.r.instName, a.r.hostName)
+			return fmt.Errorf("%w: %s or %s", ErrConflict, r.instName, r.hostName)
 		}
 		if a.lostTie.Swap(false) {
 			restarts++
 			if restarts > MaxRenames {
-				return fmt.Errorf("%w: %s or %s (lost every simultaneous probe)", ErrConflict, a.r.instName, a.r.hostName)
+				return fmt.Errorf("%w: %s or %s (lost every simultaneous probe)", ErrConflict, r.instName, r.hostName)
 			}
 			i, wait = -1, tieBreakWait
 			continue
@@ -206,7 +280,8 @@ func (a *Announcer) probe(ctx context.Context) error {
 		if i == probeCount {
 			return nil
 		}
-		a.sendAll(func(ifIndex int) ([]byte, error) { return a.r.probe(ifIndex, i == 0) })
+		first := i == 0
+		a.sendAll(func(ifIndex int) ([]byte, error) { return r.probe(ifIndex, first) })
 		wait = probeInterval
 	}
 	return nil
@@ -231,8 +306,38 @@ func (a *Announcer) announceLoop(schedule []time.Duration) {
 			return
 		case <-t.C:
 		}
-		a.sendAll(func(ifIndex int) ([]byte, error) { return a.r.unsolicited(ifIndex, false) })
+		if a.withdrawn.Load() || a.probing.Load() {
+			return
+		}
+		a.announceAll(false)
 	}
+}
+
+// announceAll multicasts every record on every joined interface: an
+// announcement or a goodbye (every TTL 0, RFC 6762 clause 10.1). Neither
+// is held back by the one-per-second limit: announcements keep their own
+// schedule, at least a second apart (clause 8.3), and answers to queries
+// are limited against them.
+func (a *Announcer) announceAll(goodbye bool) {
+	a.ifMu.Lock()
+	j4, j6 := append([]net.Interface(nil), a.joined4...), append([]net.Interface(nil), a.joined6...)
+	a.ifMu.Unlock()
+	for _, ifi := range j4 {
+		a.announceOn(outKey{ifi.Index, false}, goodbye)
+	}
+	for _, ifi := range j6 {
+		a.announceOn(outKey{ifi.Index, true}, goodbye)
+	}
+}
+
+func (a *Announcer) announceOn(k outKey, goodbye bool) {
+	recs := a.r().all(k.ifIndex)
+	if goodbye {
+		for i := range recs {
+			recs[i].TTL = 0
+		}
+	}
+	a.multicastNow(k, recs, nil, 0)
 }
 
 // sendAll multicasts a per-interface message on every joined interface.
@@ -254,6 +359,9 @@ func (a *Announcer) sendAll(build func(ifIndex int) ([]byte, error)) {
 
 // send4 sends to dst, or multicasts on the interface when dst is nil.
 func (a *Announcer) send4(b []byte, ifIndex int, dst net.Addr) {
+	if a.p4 == nil {
+		return
+	}
 	a.sendMu.Lock()
 	defer a.sendMu.Unlock()
 	if dst == nil {
@@ -266,6 +374,9 @@ func (a *Announcer) send4(b []byte, ifIndex int, dst net.Addr) {
 }
 
 func (a *Announcer) send6(b []byte, ifIndex int, dst net.Addr) {
+	if a.p6 == nil {
+		return
+	}
 	a.sendMu.Lock()
 	defer a.sendMu.Unlock()
 	if dst == nil {
@@ -277,6 +388,14 @@ func (a *Announcer) send6(b []byte, ifIndex int, dst net.Addr) {
 		dst = &net.UDPAddr{IP: group6, Port: a.port, Zone: ifi.Name}
 	}
 	_, _ = a.p6.WriteTo(b, nil, dst)
+}
+
+func (a *Announcer) send(b []byte, k outKey, dst net.Addr) {
+	if k.v6 {
+		a.send6(b, k.ifIndex, dst)
+	} else {
+		a.send4(b, k.ifIndex, dst)
+	}
 }
 
 func (a *Announcer) read4() {
@@ -291,10 +410,11 @@ func (a *Announcer) read4() {
 			continue
 		}
 		idx := 0
+		var dst net.IP
 		if cm != nil {
-			idx = cm.IfIndex
+			idx, dst = cm.IfIndex, cm.Dst
 		}
-		a.handle(buf[:n], src, idx, false)
+		a.handle(buf[:n], src, dst, idx, false)
 	}
 }
 
@@ -310,10 +430,11 @@ func (a *Announcer) read6() {
 			continue
 		}
 		idx := 0
+		var dst net.IP
 		if cm != nil {
-			idx = cm.IfIndex
+			idx, dst = cm.IfIndex, cm.Dst
 		}
-		a.handle(buf[:n], src, idx, true)
+		a.handle(buf[:n], src, dst, idx, true)
 	}
 }
 
@@ -326,74 +447,130 @@ func (a *Announcer) closed() bool {
 	}
 }
 
-// handle processes one received packet.
-func (a *Announcer) handle(pkt []byte, src net.Addr, ifIndex int, v6 bool) {
+// handle processes one received packet. dst is its destination address
+// when the platform reports it.
+func (a *Announcer) handle(pkt []byte, src net.Addr, dst net.IP, ifIndex int, v6 bool) {
 	m, err := parse(pkt)
-	if err != nil || m.Header.OpCode != 0 {
+	// Only standard queries and responses with no error code are read
+	// (RFC 6762 clause 18.3 and 18.11).
+	if err != nil || m.Header.OpCode != 0 || m.Header.RCode != 0 || a.withdrawn.Load() {
 		return
 	}
+	udp, _ := src.(*net.UDPAddr)
+	// A packet sent to our unicast address, not to the group, must come
+	// from the local link (RFC 6762 clause 11); this keeps the responder
+	// from answering, or believing, packets routed from elsewhere.
+	if dst != nil && !dst.IsMulticast() && udp != nil && !onLink(udp.IP) {
+		return
+	}
+	r := a.r()
 	if m.Header.Response {
-		if a.probing.Load() && a.r.conflicts(m) {
-			a.conflict.Store(true)
+		// Responses come from the mDNS port; others are ignored (RFC 6762
+		// clause 6).
+		if udp != nil && udp.Port != a.port {
+			return
+		}
+		if a.probing.Load() {
+			if r.conflicts(m) {
+				a.conflict.Store(true)
+			}
+			return
+		}
+		// Another responder answered with what we were about to send
+		// (duplicate answer suppression, RFC 6762 clause 7.4).
+		a.out.suppress(outKey{ifIndex, v6}, m)
+		if r.conflicts(m) {
+			a.conflictSeen()
 		}
 		return
 	}
 	if a.probing.Load() {
-		if len(m.Authorities) > 0 && a.r.tieBreak(m, ifIndex) < 0 {
+		if len(m.Authorities) > 0 && r.tieBreak(m, ifIndex) < 0 {
 			a.lostTie.Store(true)
 		}
+		return
+	}
+	// A query whose known answers go on in more packets (TC bit), or one
+	// of those further packets (RFC 6762 clause 7.2).
+	if a.ka.collect(a, m, udp, ifIndex, v6) {
 		return
 	}
 	if len(m.Questions) == 0 {
 		return
 	}
-	udp, _ := src.(*net.UDPAddr)
+	a.respond(m, udp, ifIndex, v6, false)
+}
+
+// respond answers a query. waited is true when the answer was already
+// held back for more known answers.
+func (a *Announcer) respond(m message, udp *net.UDPAddr, ifIndex int, v6 bool, waited bool) {
+	r := a.r()
 	legacy := udp != nil && udp.Port != a.port
-	unicast := legacy
+	qu := false
 	for _, q := range m.Questions {
 		if uint16(q.Class)&topBit != 0 {
-			unicast = true
+			qu = true
 		}
 	}
-	b, err := a.r.reply(m, legacy, ifIndex)
-	if err != nil || b == nil {
+	k := outKey{ifIndex, v6}
+	if legacy {
+		// One-shot queries get a unicast reply that echoes the ID and
+		// questions (RFC 6762 clause 6.7).
+		if b, err := r.reply(m, true, ifIndex); err == nil && b != nil && udp != nil {
+			a.send(b, k, udp)
+		}
 		return
 	}
-	send := func(dst net.Addr) {
-		if v6 {
-			a.send6(b, ifIndex, dst)
-		} else {
-			a.send4(b, ifIndex, dst)
-		}
+	ans, add := r.answer(m.Questions, m.Answers, ifIndex)
+	if len(ans) == 0 {
+		return
 	}
-	if unicast && udp != nil {
-		send(udp)
+	probe := len(m.Authorities) > 0
+	if qu && !probe && udp != nil && (ifIndex == 0 || a.out.multicastWithin(k, ans, 4)) {
+		// A QU question is answered by unicast, unless a record has not
+		// been multicast on this interface within a quarter of its TTL
+		// (RFC 6762 clause 5.4).
+		if b, err := r.reply(m, false, ifIndex); err == nil && b != nil {
+			a.send(b, k, udp)
+		}
 		return
 	}
 	if ifIndex == 0 {
 		return
 	}
-	// A probe (a query with proposed records in the authority section) is
-	// answered at once, so the prober sees the conflict in time.
-	if len(m.Authorities) > 0 {
-		send(nil)
+	// A probe for one of our names is answered at once by multicast, so
+	// the prober sees the conflict in time and on every socket; such a
+	// defence may repeat after 250 ms (RFC 6762 clauses 6 and 8.1).
+	if probe {
+		a.multicastNow(k, ans, add, probeDefenceGap)
 		return
 	}
-	// Multicast answers wait 20-120 ms so answers from several responders
-	// to a shared question spread out (RFC 6762 clause 6).
-	delay := 20*time.Millisecond + time.Duration(rand.Int64N(int64(100*time.Millisecond)))
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		t := time.NewTimer(delay)
-		defer t.Stop()
-		select {
-		case <-a.done:
-		case <-t.C:
-			send(nil)
+	// Answers made only of our unique records go out at once; answers
+	// with shared records wait 20-120 ms, so answers from several
+	// responders spread out, and join answers already waiting on the
+	// interface (RFC 6762 clause 6).
+	unique := true
+	for _, x := range ans {
+		if !x.Flush {
+			unique = false
 		}
-	}()
+	}
+	if unique || waited {
+		a.multicastNow(k, ans, add, time.Second)
+		return
+	}
+	a.multicastLater(k, ans, add, sharedDelay())
 }
+
+// sharedDelay is the random 20-120 ms delay before answering with shared
+// records (RFC 6762 clause 6).
+var sharedDelay = func() time.Duration {
+	return 20*time.Millisecond + time.Duration(rand.Int64N(int64(100*time.Millisecond)))
+}
+
+// probeDefenceGap is how soon a record may be multicast again in answer to
+// a probe (RFC 6762 clause 6).
+var probeDefenceGap = 250 * time.Millisecond
 
 // UpdateTXT replaces the TXT metadata and announces the new record twice,
 // one second apart, without probing again: the instance name stays the
@@ -407,7 +584,13 @@ func (a *Announcer) UpdateTXT(txt map[string]string) error {
 	if a.closed() {
 		return errors.New("mdns: announcer closed")
 	}
-	a.r.setTXT(enc)
+	if err := a.Err(); err != nil {
+		return err
+	}
+	a.r().setTXT(enc)
+	a.svcMu.Lock()
+	a.svc.TXT = cloneService(Service{TXT: txt}).TXT
+	a.svcMu.Unlock()
 	a.wg.Add(1)
 	go a.announceLoop(txtAnnounceAt)
 	return nil
@@ -429,7 +612,7 @@ func (a *Announcer) learnAddrs(ifi net.Interface) bool {
 			ips = append(ips, n.IP)
 		}
 	}
-	return a.r.setInterfaceAddrs(ifi.Index, ips)
+	return a.r().setInterfaceAddrs(ifi.Index, ips)
 }
 
 // watchInterfaces re-checks the interfaces every ifaceCheck until Close.
@@ -482,7 +665,7 @@ func (a *Announcer) refreshInterfaces() {
 	cur := currentInterfaces(a.opts)
 	byName := map[string]bool{}
 	var announce []int
-	fixed := len(a.r.fixedIPs) > 0
+	fixed := len(a.r().fixedIPs) > 0
 	a.ifMu.Lock()
 	for _, ifi := range cur {
 		byName[ifi.Name] = true
@@ -508,7 +691,7 @@ func (a *Announcer) refreshInterfaces() {
 				continue
 			}
 			leave(&ifi)
-			a.r.dropInterface(ifi.Index)
+			a.r().dropInterface(ifi.Index)
 		}
 		return out
 	}
@@ -520,16 +703,17 @@ func (a *Announcer) refreshInterfaces() {
 	}
 	j4, j6 := append([]net.Interface(nil), a.joined4...), append([]net.Interface(nil), a.joined6...)
 	a.ifMu.Unlock()
+	if a.withdrawn.Load() || a.probing.Load() {
+		return
+	}
 	for _, idx := range announce {
-		b, err := a.r.unsolicited(idx, false)
-		if err != nil {
-			continue
-		}
+		// Changed addresses must reach caches at once, so this
+		// announcement is not held back by the per-record limit.
 		if hasIndex(j4, idx) {
-			a.send4(b, idx, nil)
+			a.multicastNow(outKey{idx, false}, a.r().all(idx), nil, 0)
 		}
 		if hasIndex(j6, idx) {
-			a.send6(b, idx, nil)
+			a.multicastNow(outKey{idx, true}, a.r().all(idx), nil, 0)
 		}
 	}
 }
@@ -553,7 +737,9 @@ func hasIndex(list []net.Interface, idx int) bool {
 }
 
 // Close sends goodbye records (TTL 0), leaves the groups and closes the
-// sockets. It is safe to call more than once.
+// sockets. It is safe to call more than once. An announcer that gave its
+// names up after a conflict sends no goodbye, since the names now belong
+// to another host.
 func (a *Announcer) Close() error {
 	return a.shutdown(true)
 }
@@ -561,8 +747,11 @@ func (a *Announcer) Close() error {
 func (a *Announcer) shutdown(goodbye bool) error {
 	a.closeOnce.Do(func() {
 		close(a.done)
-		if goodbye {
-			a.sendAll(func(ifIndex int) ([]byte, error) { return a.r.unsolicited(ifIndex, true) })
+		a.cancel()
+		a.out.stop(a)
+		a.ka.stop(a)
+		if goodbye && !a.withdrawn.Load() && !a.probing.Load() {
+			a.announceAll(true)
 		}
 		var errs []error
 		if a.c4 != nil {

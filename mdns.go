@@ -5,24 +5,30 @@
 // is the one copy both use (see PROVENANCE.md).
 //
 // The responder (Announce) answers PTR, SRV, TXT, A, AAAA and ANY
-// questions for the names it owns, probes before announcing with
-// simultaneous-probe tie-breaking, renames after a conflict through
-// Options.Rename, announces unsolicited, answers legacy unicast (one-shot)
-// queries, applies known-answer suppression, re-announces a changed TXT
-// record without probing again, re-joins the groups when interfaces change
-// and sends goodbyes on Close.
+// questions for the names it owns and NSEC negative answers for the types
+// it does not have, probes before announcing with simultaneous-probe
+// tie-breaking, renames after a conflict through Options.Rename, keeps
+// watching for conflicts after probing, announces unsolicited, answers
+// legacy unicast (one-shot) queries, applies known-answer suppression
+// (also over known answers sent in several truncated packets), delays and
+// aggregates shared answers, suppresses duplicate answers, multicasts each
+// record at most once a second, re-announces a changed TXT record without
+// probing again, re-joins the groups when interfaces change and sends
+// goodbyes on Close.
 //
 // The browser (Browse, BrowseTypes) queries both ways at once by default:
 // one-shot queries from an ephemeral port, which responders that only
 // answer by unicast reply to, and multicast queries from the mDNS port with
 // the groups joined, shared with the operating system's responder, which
-// catches responders that only answer by multicast. Watch keeps browsing:
-// it caches unsolicited announcements, re-queries before records expire
-// and reports instances that appear, change and leave.
-//
-// Not built: NSEC negative answers, known answers split over truncated
-// packets, and the response aggregation and rate limits a responder for a
-// large network would need.
+// catches responders that only answer by multicast. Long known-answer
+// lists go out over several packets with the TC bit, and NSEC answers stop
+// questions for records a responder says it does not have. Watch keeps
+// browsing: it caches unsolicited announcements, re-queries before records
+// expire, drops records whose owner stays silent when others ask for them
+// (passive observation of failures), reconfirms records on request,
+// suppresses its questions when another host has just asked them, and
+// reports instances that appear, change and leave. BrowseServiceTypes
+// lists the service types on the link.
 package mdns
 
 import (
@@ -106,8 +112,15 @@ type Options struct {
 	// when zero.
 	Mode BrowseMode
 	// Rename, when set, picks a new name after a probing conflict; attempt
-	// counts from 1. Announce retries with the returned service.
+	// counts from 1. Announce retries with the returned service. It is
+	// also used when a conflict appears after probing (RFC 6762 clause
+	// 9); attempt then goes on counting from the renames before.
 	Rename func(s Service, attempt int) Service
+	// OnConflict, when set, is told about name conflicts an Announcer
+	// meets after probing (seen, kept, renamed, withdrawn), and about a
+	// rename during Announce itself. It is called from the Announcer's
+	// own goroutines, one call at a time, and must not call Close.
+	OnConflict func(ConflictEvent)
 	// Loopback turns on multicast loopback, so an announcer and a browser
 	// on the same host see each other, and lets the default interface set
 	// include the loopback interface.

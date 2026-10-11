@@ -435,11 +435,19 @@ func TestBrowseCache(t *testing.T) {
 		t.Fatalf("Addr %q does not favour the .local host", s.Addr())
 	}
 
-	// A cache-flush SRV replaces the old one.
+	// A cache-flush SRV replaces one received more than a second before
+	// (RFC 6762 clause 10.2); within that second both are kept, since an
+	// announcement may span packets.
 	moved := r.srv()
 	moved.Port = 9443
-	c.add(message{Header: dnsmessage.Header{Response: true}, Answers: []rr{moved}}, now)
-	if got := c.services(typeName, now); len(got) != 1 || got[0].Port != 9443 {
+	c.add(message{Header: dnsmessage.Header{Response: true}, Answers: []rr{moved}}, now.Add(500*time.Millisecond))
+	if got := len(c.live(now, r.instName, dnsmessage.TypeSRV)); got != 2 {
+		t.Fatalf("flush within a second left %d SRV records, want 2", got)
+	}
+	later := now.Add(2 * time.Second)
+	moved.Port = 9444
+	c.add(message{Header: dnsmessage.Header{Response: true}, Answers: []rr{moved}}, later)
+	if got := c.services(typeName, later); len(got) != 1 || got[0].Port != 9444 || len(c.live(later, r.instName, dnsmessage.TypeSRV)) != 1 {
 		t.Fatalf("after flush %+v", got)
 	}
 
@@ -455,8 +463,14 @@ func TestBrowseCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.add(gm, now)
-	if got := c.services(typeName, now); len(got) != 0 {
+	gm.Answers[1].Port = 9444 // the SRV now in the cache
+	c.add(gm, later)
+	// A goodbye leaves the record one more second (RFC 6762 clause 10.1)
+	// and it is no known answer any more.
+	if known, _ := c.pending(typeName, later); len(known) != 0 {
+		t.Fatalf("record after goodbye still a known answer: %v", known)
+	}
+	if got := c.services(typeName, later.Add(1100*time.Millisecond)); len(got) != 0 {
 		t.Fatalf("goodbye left %+v", got)
 	}
 }
@@ -490,8 +504,9 @@ func TestCacheFlushPerInterface(t *testing.T) {
 		t.Fatalf("services %+v", got)
 	}
 	// A new flushed set on interface 4 replaces only interface 4's.
-	c.addOn(resp("2001:db8::c"), 4, now)
-	if got := c.services(typeName, now); fmt.Sprint(got[0].IPs) != "[2001:db8::c fe80::b]" {
+	later := now.Add(2 * time.Second)
+	c.addOn(resp("2001:db8::c"), 4, later)
+	if got := c.services(typeName, later); fmt.Sprint(got[0].IPs) != "[2001:db8::c fe80::b]" {
 		t.Fatalf("after flush on 4: %v", got[0].IPs)
 	}
 

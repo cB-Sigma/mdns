@@ -6,6 +6,7 @@ package mdns_test
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/cB-Sigma/mdns"
@@ -36,6 +37,54 @@ func ExampleAnnounce() {
 	}
 	defer a.Close()
 	_ = a.UpdateTXT(map[string]string{"version": "2"})
+}
+
+// OnConflict hears about a name conflict that appears after probing: the
+// announcer probes again and renames, or gives the name up.
+func ExampleConflictEvent() {
+	ctx := context.Background()
+	a, err := mdns.Announce(ctx, mdns.Service{Instance: "Site gateway", Host: "gateway", Port: 8443}, "_openadr3._tcp",
+		mdns.Options{Rename: mdns.RenameInstance, OnConflict: func(e mdns.ConflictEvent) {
+			switch e.Kind {
+			case mdns.ConflictRenamed:
+				fmt.Printf("now %q (was %q)\n", e.Service.Instance, e.Previous.Instance)
+			case mdns.ConflictWithdrawn:
+				fmt.Println("gave the name up:", e.Err)
+			}
+		}})
+	if err != nil {
+		return
+	}
+	defer a.Close()
+}
+
+// BrowseServiceTypes lists the service types announced on the link.
+func ExampleBrowseServiceTypes() {
+	types, err := mdns.BrowseServiceTypes(context.Background(), mdns.Options{Wait: 3 * time.Second})
+	if err != nil {
+		return
+	}
+	fmt.Println(types)
+}
+
+// Reconfirm asks whether an instance a connection failed to is still
+// there; the Watcher reports Removed if it does not answer.
+func ExampleWatcher_Reconfirm() {
+	ctx := context.Background()
+	w, err := mdns.Watch(ctx, []string{"_hue._tcp"}, mdns.Options{}, nil)
+	if err != nil {
+		return
+	}
+	defer w.Close()
+	<-w.Settled()
+	for _, s := range w.Services("_hue._tcp") {
+		c, err := net.DialTimeout("tcp", s.Addr(), 2*time.Second)
+		if err != nil {
+			w.Reconfirm("_hue._tcp", s.Instance)
+			continue
+		}
+		_ = c.Close()
+	}
 }
 
 // RenameInstance numbers the instance name after a conflict and keeps the

@@ -75,6 +75,12 @@ type Watcher struct {
 
 	mu   sync.Mutex
 	last map[string]map[string]Service // type -> lower-cased instance -> service
+	// asked holds when another host last asked each question with no
+	// known answers for it, for duplicate question suppression (RFC 6762
+	// clause 7.3).
+	asked map[want]time.Time
+	// again are the re-sends of reconfirmation queries still to come.
+	again []resend
 
 	dirty   chan struct{}
 	settled chan struct{}
@@ -100,15 +106,15 @@ func Watch(ctx context.Context, services []string, opts Options, fn func(Event))
 	}
 	ctx, stop := context.WithCancel(ctx)
 	w := &Watcher{services: services, names: names, opts: opts, ifaces: ifaces, c: newCache(), fn: fn,
-		last: map[string]map[string]Service{}, dirty: make(chan struct{}, 1), settled: make(chan struct{}),
+		last: map[string]map[string]Service{}, asked: map[want]time.Time{}, dirty: make(chan struct{}, 1), settled: make(chan struct{}),
 		done: make(chan struct{}), stop: stop}
-	w.q, err = newQuerier(ctx, opts, ifaces, func(m message, ifIndex int) {
-		w.c.addFor(m, ifIndex, time.Now(), names)
+	w.q, err = newQuerier(ctx, opts, ifaces, func(m message, ifIndex int, mc bool) {
+		w.c.addFor(m, ifIndex, time.Now(), names, mc)
 		select {
 		case w.dirty <- struct{}{}:
 		default:
 		}
-	})
+	}, w.observe)
 	if err != nil {
 		stop()
 		return nil, err
@@ -187,8 +193,10 @@ func (w *Watcher) loop(ctx context.Context, wait time.Duration) {
 			}
 		}
 		if due := w.c.due(w.names, now); len(due) > 0 {
-			w.refresh(due)
+			w.refresh(w.unasked(due, now))
 		}
+		w.resendReconfirms(now)
+		w.c.expireSilent(now)
 		if now.Sub(lastIface) >= ifaceCheck {
 			lastIface = now
 			if cur := currentInterfaces(w.opts); len(cur) > 0 && w.q.setInterfaces(cur) {
@@ -215,6 +223,145 @@ func (w *Watcher) loop(ctx context.Context, wait time.Duration) {
 		case <-tick.C:
 		case <-w.dirty:
 		}
+	}
+}
+
+// observe takes a query another host multicast from the mDNS port (a
+// one-shot querier gets unicast answers this Watcher cannot hear, so its
+// queries say nothing): it counts towards passive observation of failures
+// (RFC 6762 clause 10.5) and notes questions asked with no known answers,
+// for duplicate question suppression (clause 7.3). Probes are left out.
+func (w *Watcher) observe(m message, src *net.UDPAddr, ifIndex int) {
+	if src.Port != w.opts.port() || len(m.Authorities) > 0 {
+		return
+	}
+	now := time.Now()
+	w.c.observeQuery(m, now)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for k, t := range w.asked {
+		if now.Sub(t) > dupQuestionWindow {
+			delete(w.asked, k)
+		}
+	}
+next:
+	for _, q := range m.Questions {
+		if uint16(q.Class)&topBit != 0 {
+			continue
+		}
+		name := q.Name.String()
+		for _, k := range m.Answers {
+			if strings.EqualFold(k.Name, name) {
+				continue next
+			}
+		}
+		w.asked[want{strings.ToLower(name), q.Type}] = now
+	}
+}
+
+// dupQuestionWindow is how recently another host must have asked a
+// question for this Watcher to treat its own as sent (RFC 6762 clause
+// 7.3).
+var dupQuestionWindow = time.Second
+
+// unasked drops from due the questions another host asked within
+// dupQuestionWindow.
+func (w *Watcher) unasked(due []want, now time.Time) []want {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var out []want
+	for _, x := range due {
+		if t, ok := w.asked[want{strings.ToLower(x.name), x.typ}]; ok && now.Sub(t) <= dupQuestionWindow {
+			continue
+		}
+		out = append(out, x)
+	}
+	return out
+}
+
+// resend is a reconfirmation query still to be sent.
+type resend struct {
+	qs []want
+	at time.Time
+}
+
+// reconfirmWait is how long a reconfirmed record lives without an answer;
+// reconfirmAt are the offsets of the queries sent for it (RFC 6762 clause
+// 10.4).
+var (
+	reconfirmWait = 10 * time.Second
+	reconfirmAt   = []time.Duration{0, time.Second, 3 * time.Second}
+)
+
+// Reconfirm asks the network whether instance (its label, as in
+// Service.Instance) of service (one of the types given to Watch) is still
+// there, for when a connection to it failed: the Watcher queries for its
+// PTR, SRV, TXT and address records several times, and removes those that
+// get no answer within ten seconds, reporting Removed when the instance
+// goes (RFC 6762 clause 10.4). It returns false when the instance is not
+// known.
+func (w *Watcher) Reconfirm(service, instance string) bool {
+	typeName := ""
+	for i, s := range w.services {
+		if s == service {
+			typeName = w.names[i]
+		}
+	}
+	if typeName == "" {
+		return false
+	}
+	base := typeName
+	if i := strings.Index(strings.ToLower(base), "._sub."); i >= 0 {
+		base = base[i+len("._sub."):]
+	}
+	inst := instance + "." + base
+	now := time.Now()
+	w.c.mu.Lock()
+	var hosts []string
+	for _, s := range w.c.live(now, inst, dnsmessage.TypeSRV) {
+		hosts = append(hosts, s.Target)
+	}
+	w.c.mu.Unlock()
+	qs := w.c.markReconfirm(func(r rr) bool {
+		switch r.Type {
+		case dnsmessage.TypePTR:
+			return strings.EqualFold(r.PTR, inst)
+		case dnsmessage.TypeA, dnsmessage.TypeAAAA:
+			return slices.ContainsFunc(hosts, func(h string) bool { return strings.EqualFold(h, r.Name) })
+		}
+		return strings.EqualFold(r.Name, inst)
+	}, now.Add(reconfirmWait))
+	if len(qs) == 0 {
+		return false
+	}
+	w.mu.Lock()
+	for _, at := range reconfirmAt {
+		w.again = append(w.again, resend{qs: qs, at: now.Add(at)})
+	}
+	w.mu.Unlock()
+	select {
+	case w.dirty <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// resendReconfirms sends the reconfirmation queries that are due.
+func (w *Watcher) resendReconfirms(now time.Time) {
+	w.mu.Lock()
+	var due [][]want
+	keep := w.again[:0]
+	for _, r := range w.again {
+		if now.Before(r.at) {
+			keep = append(keep, r)
+			continue
+		}
+		due = append(due, r.qs)
+	}
+	w.again = keep
+	w.mu.Unlock()
+	for _, qs := range due {
+		w.refresh(qs)
 	}
 }
 
