@@ -1,0 +1,32 @@
+mdns (multicast DNS and DNS-SD, in Go)
+Copyright 2026 Abhinav Gautam
+
+This module is licensed under the Apache License, Version 2.0 (LICENSE).
+
+The code was written for SigmaM2M from the IETF RFCs listed in
+PROVENANCE.md. It contains no code from other projects. The source files
+that come from SigmaM2M (mdns.go, message.go, responder.go, announce.go,
+browse.go, testiface.go, mdns_test.go) carry no per-file copyright header,
+the convention of the code they come from; the copyright line above covers
+them. Files added for this module carry "Copyright 2026 Abhinav Gautam"
+and "SPDX-License-Identifier: Apache-2.0".
+
+Dependencies
+------------
+
+golang.org/x/net    BSD-3-Clause, Copyright The Go Authors (DNS messages, IPv4 and IPv6 multicast)
+golang.org/x/sys    BSD-3-Clause, Copyright The Go Authors (SO_REUSEPORT)
+The Go standard library: BSD-3-Clause, Copyright The Go Authors.
+
+Test-only module interop/ (not part of this module)
+---------------------------------------------------
+
+It has its own go.mod and uses, as peers in tests only:
+
+github.com/hashicorp/mdns          MIT
+github.com/grandcat/zeroconf       MIT
+github.com/miekg/dns               BSD-3-Clause (through both)
+github.com/cenkalti/backoff        MIT (through grandcat/zeroconf)
+golang.org/x/mod, x/sync, x/tools  BSD-3-Clause (through miekg/dns)
+
+No code of theirs is copied here.

@@ -1,0 +1,29 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: go vet ./...
+      - name: build without cgo
+        run: CGO_ENABLED=0 go build ./...
+      - name: test
+        run: go test -race ./...
+      - name: staticcheck
+        continue-on-error: true
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...

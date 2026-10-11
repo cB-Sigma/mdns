@@ -1,0 +1,12 @@
+# Build and test output
+*.test
+*.out
+coverage.*
+/dist/
+
+# Workspaces and editors
+go.work
+go.work.sum
+.idea/
+.vscode/
+.DS_Store
