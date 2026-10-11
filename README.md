@@ -45,6 +45,34 @@ bound (another responder holds it without SO_REUSEPORT, or Windows), the
 browser carries on with one-shot queries. In a container, multicast needs
 the host network.
 
+## Choosing a Go mDNS library
+
+Compared from each library's source at the versions named, in October
+2026; "tested" rows were run on one macOS LAN. Check the projects
+themselves before relying on a row.
+
+| | this module | hashicorp/mdns v1.0.7 | grandcat/zeroconf v1.0.0 | libp2p/zeroconf v2.2.0 | brutella/dnssd v1.2.14 | pion/mdns v2.2.2 |
+|---|---|---|---|---|---|---|
+| Announces unsolicited (not only answers queries) | yes | no | yes | yes | yes | yes |
+| Probing, conflict renaming | yes, with tie-breaking | no | no | no | yes, with tie-breaking | no |
+| Subtypes, announce and browse (tested) | yes | no | no | yes | no | no |
+| Answers one-shot (legacy unicast) queries (tested) | yes | yes | no | no | yes | yes |
+| Finds unicast-only and multicast-only responders in one browse (tested) | yes | no | no | no | no | no |
+| Browse returns only the asked type | yes | no, other types too | yes | yes | yes | no, caller filters |
+| Continuous browse with change events | yes (`Watch`) | no | partial | yes | yes | yes |
+| Goodbye on close | yes | no | yes | yes | yes | yes |
+| Port other than 5353, for tests | yes | no | no | no | no | yes |
+| `context.Context` | yes | timeouts only | yes | yes | yes | yes |
+| Dependencies | golang.org/x/net | miekg/dns | miekg/dns and two more | miekg/dns | miekg/dns, netlink | pion/logging, pion/transport |
+
+Pick this module when you need to be found reliably and to find every
+kind of device on a real LAN: Matter, HomeKit-style or OpenADR
+announcements with subtypes and probing, or discovery of consumer devices
+whose responders answer only one way. Pick hashicorp/mdns if you already
+use it, only need simple lookups in a controlled network, and want the
+longest track record. Pick pion/mdns inside a pion WebRTC stack, and
+brutella/dnssd for a HomeKit accessory built on brutella/hap.
+
 ## Install
 
 ```
