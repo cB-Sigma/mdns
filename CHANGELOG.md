@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.3.0 (2026-10-12)
+
+The API only grows; code written for v0.2 builds unchanged.
+
+### Added
+
+- `Reflect` and `Reflector`: repeat mDNS between interfaces (VLANs, guest
+  networks), IPv4 and IPv6, with loop suppression per interface;
+  `Reflector.Reflected`.
+- `BrowseDomains` and `Domains`: the browsing and registration domain
+  enumeration of RFC 6763 clause 11.
+- `Options.StrictSource`: the browser drops answers from off-link sources
+  (RFC 6762 clause 11), off by default.
+- `Options.QU`: the unicast-response bit on the first query of a browse
+  (RFC 6762 clause 5.4), off by default.
+- Interop tests: mDNSResponder through dns-sd on macOS; python-zeroconf
+  0.151.5 in Docker (discovery both ways, subtypes, conflicts both ways,
+  goodbye, 30 instances each way); several interfaces; an IPv6-only
+  network; the reflector between two networks.
+- `// Covers:` requirement IDs on the tests added in v0.2.0.
+
 ## v0.2.0 (2026-10-11)
 
 Every "no" in the v0.1 feature table is now implemented. The API only

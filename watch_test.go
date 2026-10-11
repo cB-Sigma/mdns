@@ -17,6 +17,7 @@ import (
 // TestCacheRefreshSchedule: a record is asked for again at 80, 85, 90 and
 // 95 % of its TTL (plus at most 2 %), once at each step, and not again
 // after a fresh copy arrives; records of other types are not refreshed.
+// Covers: SIG-IPE-7350
 func TestCacheRefreshSchedule(t *testing.T) {
 	r, err := newResponder(testService(), ServiceType)
 	if err != nil {
@@ -62,6 +63,7 @@ func TestCacheRefreshSchedule(t *testing.T) {
 // response on the link; only the browsed types' records are kept, and the
 // later expiry wins when a record arrives both by multicast and in a
 // legacy reply capped at 10 s.
+// Covers: SIG-IPE-7350
 func TestCacheKeepsOnlyBrowsedRecords(t *testing.T) {
 	r, err := newResponder(testService(), ServiceType)
 	if err != nil {

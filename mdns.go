@@ -121,6 +121,17 @@ type Options struct {
 	// rename during Announce itself. It is called from the Announcer's
 	// own goroutines, one call at a time, and must not call Close.
 	OnConflict func(ConflictEvent)
+	// StrictSource makes Browse and Watch drop answers whose source
+	// address is not on a link of this host (RFC 6762 clause 11), as the
+	// responder always does for queries. Off by default, so that a device
+	// with a misconfigured address on the segment is still found.
+	StrictSource bool
+	// QU sets the unicast-response bit on the first query of a browse
+	// (RFC 6762 clause 5.4). Off by default: a unicast reply to port 5353
+	// reaches only one of the sockets sharing it, often the operating
+	// system's responder, so use it only where this process owns the port
+	// or uses its own (Port).
+	QU bool
 	// Loopback turns on multicast loopback, so an announcer and a browser
 	// on the same host see each other, and lets the default interface set
 	// include the loopback interface.

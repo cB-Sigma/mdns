@@ -8,7 +8,7 @@ go 1.27.1
 replace github.com/cB-Sigma/mdns => ../
 
 require (
-	github.com/cB-Sigma/mdns v0.0.0
+	github.com/cB-Sigma/mdns v0.3.0
 	github.com/grandcat/zeroconf v1.0.0
 	github.com/hashicorp/mdns v1.0.7
 )

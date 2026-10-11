@@ -7,7 +7,7 @@ A multicast DNS (RFC 6762) and DNS-SD (RFC 6763) responder and browser in pure G
 It announces services with subtypes, probes, renames on conflicts found
 while probing or later, and browses so that it finds responders that
 answer only by unicast as well as those that answer only by multicast,
-once or continuously. It is built on golang.org/x/net and the standard
+once or continuously, and reflects mDNS between network segments. It is built on golang.org/x/net and the standard
 library, without cgo. It was written for SigmaM2M, a oneM2M platform,
 where it serves OpenADR 3, Matter and several device integrations.
 
@@ -43,21 +43,22 @@ Clauses are RFC 6762 unless marked RFC 6763.
 | Duplicate question suppression for refresh queries (7.3) | yes, in `Watch` (since v0.2.0) |
 | Service type enumeration as a browser: `BrowseServiceTypes` (RFC 6763 9) | yes (since v0.2.0) |
 | IPv4 and IPv6 | yes |
+| Off-link answers dropped by the browser on request (11): `Options.StrictSource` | yes (since v0.3.0) |
+| QU on the first query of a browse (5.4): `Options.QU` | yes (since v0.3.0) |
+| Browsing domain enumeration as a browser (RFC 6763 11): `BrowseDomains` | yes (since v0.3.0) |
+| Reflector between interfaces or VLANs: `Reflect` (not in RFC 6762; Avahi's practice) | yes (since v0.3.0) |
 
-Left out on purpose:
+Off by default, on purpose:
 
-- QU questions from the browser (5.4). A unicast reply to port 5353
-  reaches only one of the sockets that share it, often the operating
-  system's responder, so the browser asks without QU and gets unicast
-  answers through its one-shot socket instead.
-- Browsing domains (RFC 6763 11, `b._dns-sd._udp` and the like). They
-  point at unicast DNS-SD domains; on the link, `local.` is the only
-  domain.
-- Off-link source checks in the browser (11). A device with a wrong static
-  address on the same segment should still be found, so the browser takes
-  answers from any source; a host off the link that can reach the
-  browser's one-shot port could therefore add records to its results. The
-  responder does check.
+- QU questions from the browser (5.4, `Options.QU`). A unicast reply to
+  port 5353 reaches only one of the sockets that share it, often the
+  operating system's responder, so by default the browser asks without QU
+  and gets unicast answers through its one-shot socket instead.
+- Off-link source checks in the browser (11, `Options.StrictSource`). A
+  device with a wrong static address on the same segment should still be
+  found, so by default the browser takes answers from any source; a host
+  off the link that can reach the browser's one-shot port could then add
+  records to its results. The responder always checks.
 
 ### Why both ways at once
 
@@ -111,9 +112,11 @@ use it, only need simple lookups in a controlled network, and want the
 longest track record. Pick pion/mdns inside a pion WebRTC stack, and
 brutella/dnssd for a HomeKit accessory built on brutella/hap.
 brutella/dnssd also keeps results of Apple's Bonjour Conformance Test in
-its repository; this module has not been run against that test, so where
-a passed conformance run is a requirement, brutella/dnssd is the one with
-evidence.
+its repository; this module has not been run against that test (Apple
+serves it only after an Apple ID sign-in on developer.apple.com, checked
+2026-10-12), so where a passed conformance run is a requirement,
+brutella/dnssd is the one with evidence. This module's evidence instead is
+interop with mDNSResponder itself, python-zeroconf and Avahi (below).
 
 ## Install
 
@@ -165,9 +168,9 @@ API reference: https://pkg.go.dev/github.com/cB-Sigma/mdns
 
 | Package | What it does |
 |---|---|
-| `mdns` (module root) | `Announce` (probe with tie-breaking, `Options.Rename` with `RenameInstance`, announce, answer with NSEC, delays, aggregation and rate limits, `UpdateTXT`, re-join on interface changes, goodbye on `Close`; conflicts after probing through `Options.OnConflict`, `Announcer.Service`, `Announcer.Err`), `Browse` and `BrowseTypes` (one-shot and multicast queries at once by default; `Options.Mode` for either alone), `BrowseServiceTypes`, `Watch` (continuous: cached announcements, refresh before expiry, passive observation of failures, `Watcher.Reconfirm`, `Added`/`Updated`/`Removed` events), `TestInterface` |
+| `mdns` (module root) | `Announce` (probe with tie-breaking, `Options.Rename` with `RenameInstance`, announce, answer with NSEC, delays, aggregation and rate limits, `UpdateTXT`, re-join on interface changes, goodbye on `Close`; conflicts after probing through `Options.OnConflict`, `Announcer.Service`, `Announcer.Err`), `Browse` and `BrowseTypes` (one-shot and multicast queries at once by default; `Options.Mode` for either alone), `BrowseServiceTypes`, `BrowseDomains`, `Reflect` (a reflector between interfaces), `Options.StrictSource` and `Options.QU`, `Watch` (continuous: cached announcements, refresh before expiry, passive observation of failures, `Watcher.Reconfirm`, `Added`/`Updated`/`Removed` events), `TestInterface` |
 | `internal/reuse` | SO_REUSEADDR and SO_REUSEPORT on the mDNS sockets |
-| `interop` (nested module, tests only) | this module against hashicorp/mdns and grandcat/zeroconf on the real port 5353, and against Avahi in Linux containers (`cmd/avahipeer`, `testdata/avahi`) |
+| `interop` (nested module, tests only) | this module against hashicorp/mdns and grandcat/zeroconf on the real port 5353, the system's mDNSResponder through dns-sd (macOS), and against Avahi and python-zeroconf in Linux containers, on several networks, an IPv6-only network and through the reflector (`cmd/avahipeer`, `testdata/avahi`, `testdata/zeroconf`) |
 
 ## Testing
 
@@ -179,8 +182,7 @@ Tests that need multicast pick a random port and an interface on which
 multicast loops back to the host; they skip when there is none, and with
 `-short`. Tests carry `// Covers: SIG-...` and `// Covers: SIG-MTR-...`
 comments: these are requirement IDs of the SigmaM2M project's compliance
-report and have no meaning outside it. The tests added in v0.2.0 carry
-none yet.
+report and have no meaning outside it.
 
 The browse and watch tests against the simulated devices are in
 [mdns-sim](https://github.com/cB-Sigma/mdns-sim), so this module does not
@@ -197,9 +199,18 @@ Docker Desktop on macOS and Windows runs containers in a virtual machine,
 where multicast does not reach the host, so both peers run in containers.
 
 ```
-cd interop && SIGMA_MDNS_INTEROP=1 go test -v ./...   # LAN peers and Avahi
+cd interop && SIGMA_MDNS_INTEROP=1 go test -v ./...   # LAN peers, mDNSResponder (macOS), and the Docker tests
 cd interop && go test -v -run TestAvahi ./...         # Avahi only
+cd interop && go test -v -run 'TestZeroconf|TestMultiInterface|TestIPv6Only|TestReflector' ./...
 ```
+
+The python-zeroconf tests (`TestZeroconf`, `TestMultiInterface`,
+`TestIPv6Only`, `TestReflector`) build an image of python-zeroconf
+0.151.5 with `avahipeer` (`testdata/zeroconf`) and run containers on
+Docker networks: one, two (a container on both), an IPv6-only one, and
+two joined by our reflector. `TestMDNSResponder` drives the system's
+mDNSResponder through `dns-sd` on the real port 5353 and needs
+`SIGMA_MDNS_INTEROP=1` and macOS.
 
 ### Interop tested against
 
@@ -236,11 +247,36 @@ cd interop && go test -v -run TestAvahi ./...         # Avahi only
   `BrowseServiceTypes` listed six types (the Mac's own mDNSResponder
   types and a Sony BRAVIA's `_googlecast._tcp` and
   `_androidtvremote2._tcp`).
-- Not yet: systemd-resolved, Windows, Apple's Bonjour Conformance Test,
-  several active interfaces, IPv6-only links. NSEC, truncated known
-  answers, rate limits, passive observation and late conflicts are tested
-  against the simulator and hand-built packets (written by the same
-  author), not against another implementation.
+- mDNSResponder (macOS 26.3.1, the system's, through `dns-sd`, LAN,
+  2026-10-12; v0.3.0): `dns-sd -B` found our announcer and, with
+  `_sigmadnssd._tcp,_vtn`, its subtype; `dns-sd -L` resolved host, port
+  and TXT; `dns-sd -G v4` our address; `dns-sd -G v6` for our IPv4-only
+  host reported "No Such Record" (it took our NSEC, which Avahi 0.8 did
+  not); our browsers in every mode and `BrowseServiceTypes` found a
+  `dns-sd -R` registration; we renamed to "… (2)" when mDNSResponder held
+  the name, and mDNSResponder renamed its registration when we held it;
+  `dns-sd -B` showed our goodbye as Rmv.
+- python-zeroconf 0.151.5 on Linux (Docker, 2026-10-12; v0.3.0): it found
+  and resolved our announcer and its subtype; our browsers found its
+  service in every mode; it renamed to "Held Name-2" when we held the
+  name, and we renamed to "ZC Held (2)" when it did; it saw our goodbye;
+  30 instances each way, which take responses over several packets, were
+  all found both ways.
+- Several interfaces (Docker, v0.3.0): our announcer in a container on two
+  networks was found by python-zeroconf on each network with that
+  network's address only, and our browser found services on both.
+- An IPv6-only network (Docker, v0.3.0): our announcer was found by
+  python-zeroconf over IPv6 with its IPv6 address, and our browser found
+  python-zeroconf's service with its IPv6 address.
+- Our reflector (Docker, v0.3.0): with it, python-zeroconf and our
+  browser on one network found a service registered on the other; without
+  it they did not.
+- Not yet: systemd-resolved (it needs systemd in a container), Windows
+  (no Windows host here), Apple's Bonjour Conformance Test (Apple ID
+  sign-in needed). Truncated known-answer trains, rate limits and passive
+  observation are exercised by the multi-packet cases above only
+  indirectly; their exact behaviour is tested against the simulator and
+  hand-built packets (same author).
 
 ## Related repositories
 

@@ -26,6 +26,7 @@ import (
 type querier struct {
 	port       int
 	loopback   bool
+	strict     bool // drop answers from off-link sources (Options.StrictSource)
 	onResponse func(m message, ifIndex int, mcast bool)
 	onQuery    func(m message, src *net.UDPAddr, ifIndex int)
 
@@ -46,7 +47,7 @@ type querier struct {
 }
 
 func newQuerier(ctx context.Context, opts Options, ifaces []net.Interface, onResponse func(message, int, bool), onQuery func(message, *net.UDPAddr, int)) (*querier, error) {
-	q := &querier{port: opts.port(), loopback: opts.Loopback, onResponse: onResponse, onQuery: onQuery, ifaces: ifaces,
+	q := &querier{port: opts.port(), loopback: opts.Loopback, strict: opts.StrictSource, onResponse: onResponse, onQuery: onQuery, ifaces: ifaces,
 		sent: map[string]time.Time{}, closed: make(chan struct{})}
 	var errs []error
 	if opts.Mode.oneShot() {
@@ -147,6 +148,9 @@ func (q *querier) read(listening bool, read func([]byte) (int, int, net.IP, net.
 			continue
 		}
 		if m.Header.Response {
+			if !q.acceptFrom(src) {
+				continue // an answer from off the link (RFC 6762 11, Options.StrictSource)
+			}
 			q.onResponse(m, ifIndex, dst != nil && dst.IsMulticast())
 			continue
 		}
@@ -296,4 +300,11 @@ func (q *querier) close() {
 		}
 		q.wg.Wait()
 	})
+}
+
+// acceptFrom reports whether an answer from src is taken: always, unless
+// Options.StrictSource asks for on-link sources only (RFC 6762 clause 11).
+func (q *querier) acceptFrom(src net.Addr) bool {
+	udp, ok := src.(*net.UDPAddr)
+	return !q.strict || !ok || onLink(udp.IP)
 }

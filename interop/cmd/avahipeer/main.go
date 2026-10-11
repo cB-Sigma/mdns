@@ -8,6 +8,8 @@
 //	avahipeer [-out file] browse <type> <wait> [both|oneshot|multicast]
 //	avahipeer [-out file] types <wait>
 //	avahipeer [-out file] announce <instance> <host> <type> <port> <duration> [subtype]
+//	avahipeer [-out file] announce-many <prefix> <n> <host> <type> <port> <duration>
+//	avahipeer [-out file] reflect <duration>
 //
 // It uses every multicast-capable interface of the container and the real
 // mDNS port, next to the container's avahi-daemon.
@@ -133,6 +135,56 @@ func run(args []string) error {
 		time.Sleep(d)
 		emit(map[string]string{"event": "closing", "instance": a.Service().Instance})
 		return a.Close()
+	case "reflect":
+		// reflect <duration>: an mDNS reflector on every interface.
+		if len(args) < 2 {
+			return fmt.Errorf("reflect <duration>")
+		}
+		d, err := time.ParseDuration(args[1])
+		if err != nil {
+			return err
+		}
+		r, err := mdns.Reflect(ctx, mdns.Options{})
+		if err != nil {
+			return err
+		}
+		emit(map[string]any{"event": "reflecting"})
+		time.Sleep(d)
+		emit(map[string]any{"event": "reflected", "count": r.Reflected()})
+		return r.Close()
+	case "announce-many":
+		// announce-many <prefix> <n> <host> <type> <port> <duration>: n
+		// instances "<prefix> <i>" on one host, for responses that need
+		// more than one packet.
+		if len(args) < 7 {
+			return fmt.Errorf("announce-many <prefix> <n> <host> <type> <port> <duration>")
+		}
+		n, err := strconv.Atoi(args[2])
+		if err != nil {
+			return err
+		}
+		port, err := strconv.Atoi(args[5])
+		if err != nil {
+			return err
+		}
+		d, err := time.ParseDuration(args[6])
+		if err != nil {
+			return err
+		}
+		var all []*mdns.Announcer
+		for i := 0; i < n; i++ {
+			s := mdns.Service{Instance: fmt.Sprintf("%s %d", args[1], i), Host: args[3], Port: port, TXT: map[string]string{"peer": "sigma"}}
+			a, err := mdns.Announce(ctx, s, args[4], mdns.Options{Rename: mdns.RenameInstance})
+			if err != nil {
+				return err
+			}
+			all = append(all, a)
+		}
+		emit(map[string]any{"event": "announced", "count": len(all)})
+		time.Sleep(d)
+		for _, a := range all {
+			_ = a.Close()
+		}
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}

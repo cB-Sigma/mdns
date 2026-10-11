@@ -46,6 +46,14 @@ named in the README. Avahi (avahi-daemon 0.8 and its command-line tools,
 from Alpine's packages, installed in a container at test time and not
 distributed) was likewise run, not read, on 2026-10-11.
 
+For v0.3.0, python-zeroconf 0.151.5 (LGPL-2.1) and the macOS 26.3.1
+mDNSResponder (through dns-sd) were run as peers, not read, on
+2026-10-12. The reflector repeats multicast mDNS between interfaces, the behaviour
+Avahi's enable-reflector option is known for; it was written without
+reading Avahi's code. RFC 6763 clause 11
+(browsing domains) and RFC 6762 clauses 5.4 and 11 were followed for
+BrowseDomains, Options.QU and Options.StrictSource.
+
 For the README's comparison table, the sources of hashicorp/mdns,
 grandcat/zeroconf, libp2p/zeroconf, brutella/dnssd and pion/mdns at the
 versions named there were searched for NSEC, TC, conflict, delay and

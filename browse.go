@@ -76,7 +76,7 @@ func BrowseTypes(ctx context.Context, services []string, opts Options) (map[stri
 	var errs []error
 	sent := 0
 	start := time.Now()
-	for _, at := range queryAt {
+	for i, at := range queryAt {
 		t := time.NewTimer(time.Until(start.Add(at)))
 		select {
 		case <-ctx.Done():
@@ -86,7 +86,7 @@ func BrowseTypes(ctx context.Context, services []string, opts Options) (map[stri
 		if ctx.Err() != nil {
 			break
 		}
-		pkts, err := c.queries(names, time.Now())
+		pkts, err := c.queriesQU(names, time.Now(), opts.QU && i == 0)
 		if err != nil {
 			errs = append(errs, err)
 			break
@@ -481,10 +481,16 @@ func (c *cache) halfLife(r rr, now time.Time) bool {
 // maxQuery, then one per type; a type whose known answers do not fit in
 // one packet sends them on in more, with the TC bit (RFC 6762 clause 7.2).
 func (c *cache) queries(typeNames []string, now time.Time) ([][]byte, error) {
+	return c.queriesQU(typeNames, now, false)
+}
+
+// queriesQU is queries with the unicast-response bit on the PTR questions
+// when qu is set (RFC 6762 5.4, Options.QU).
+func (c *cache) queriesQU(typeNames []string, now time.Time, qu bool) ([][]byte, error) {
 	build := func(types []string) (message, error) {
 		m := message{}
 		for _, t := range types {
-			q, err := question(t, dnsmessage.TypePTR, false)
+			q, err := question(t, dnsmessage.TypePTR, qu)
 			if err != nil {
 				return m, err
 			}

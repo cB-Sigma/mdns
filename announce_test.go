@@ -236,6 +236,7 @@ func ipList(ips []net.IP) string {
 
 // TestRenameInstance numbers instance names the way DNS-SD browsers show
 // them and keeps them within one label.
+// Covers: SIG-IPE-7344
 func TestRenameInstance(t *testing.T) {
 	s := Service{Instance: "Site gateway", Host: "vtn"}
 	if got := RenameInstance(s, 1).Instance; got != "Site gateway (2)" {

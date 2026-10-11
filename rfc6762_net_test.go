@@ -24,6 +24,7 @@ import (
 // 400-500 ms for the rest of its known answers; a known answer that comes
 // in a following packet suppresses our answer, and without one the answer
 // follows the wait (RFC 6762 clause 7.2).
+// Covers: SIG-IPE-7341
 func TestKnownAnswersOverTruncatedPackets(t *testing.T) {
 	port, ifi := testPort(t)
 	setVar(t, &announceAt, []time.Duration{0})
@@ -69,6 +70,7 @@ func TestKnownAnswersOverTruncatedPackets(t *testing.T) {
 // probe (every 250 ms), an answer another responder has just given is not
 // repeated, and a QU question gets a unicast reply unless the record has
 // not been multicast lately (RFC 6762 clauses 5.4, 6 and 7.4).
+// Covers: SIG-IPE-7342
 func TestResponseTimingAndLimits(t *testing.T) {
 	port, ifi := testPort(t)
 	setVar(t, &announceAt, []time.Duration{0})
@@ -221,6 +223,7 @@ func (l *conflictLog) wait(t *testing.T, d time.Duration, kinds ...ConflictKind)
 // as it was; an owner that answers the probes makes it rename through
 // Options.Rename, or without Rename give the name up, and the caller hears
 // each step.
+// Covers: SIG-IPE-7344
 func TestConflictAfterProbing(t *testing.T) {
 	port, ifi := testPort(t)
 	setVar(t, &announceAt, []time.Duration{0})
@@ -325,6 +328,7 @@ func TestConflictAfterProbing(t *testing.T) {
 // TestWatchPassiveObservation: a device that announced and then went away
 // without a goodbye is removed once other hosts have asked for it twice
 // without an answer (RFC 6762 clause 10.5); one that still answers stays.
+// Covers: SIG-IPE-7345
 func TestWatchPassiveObservation(t *testing.T) {
 	port, ifi := testPort(t)
 	setVar(t, &poofWindow, 2*time.Second)
@@ -377,6 +381,7 @@ func TestWatchPassiveObservation(t *testing.T) {
 
 // TestWatchReconfirm: Reconfirm removes an instance that no longer
 // answers (RFC 6762 clause 10.4) and keeps one that does.
+// Covers: SIG-IPE-7346
 func TestWatchReconfirm(t *testing.T) {
 	port, ifi := testPort(t)
 	setVar(t, &reconfirmWait, 1500*time.Millisecond)
@@ -430,6 +435,7 @@ func TestWatchReconfirm(t *testing.T) {
 
 // TestBrowseServiceTypes: the service type enumeration finds the type of
 // every announcer on the link, each once (RFC 6763 clause 9).
+// Covers: SIG-IPE-7349
 func TestBrowseServiceTypes(t *testing.T) {
 	port, ifi := testPort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

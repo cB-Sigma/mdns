@@ -30,3 +30,8 @@ github.com/cenkalti/backoff        MIT (through grandcat/zeroconf)
 golang.org/x/mod, x/sync, x/tools  BSD-3-Clause (through miekg/dns)
 
 No code of theirs is copied here.
+
+Its Docker tests also install, in containers at test time and not
+distributed: Avahi (LGPL-2.1, Alpine packages) and python-zeroconf
+0.151.5 (LGPL-2.1, from PyPI); testdata/zeroconf/zcpeer.py, ours, only
+calls python-zeroconf. The macOS test runs the system's dns-sd.

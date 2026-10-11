@@ -29,6 +29,7 @@ func testService() Service {
 	}
 }
 
+// Covers: SIG-IPE-7351
 func TestTXTEncodeDecode(t *testing.T) {
 	enc, err := encodeTXT(map[string]string{"b": "2", "a": "x=y", "c": ""})
 	if err != nil {
@@ -52,6 +53,7 @@ func TestTXTEncodeDecode(t *testing.T) {
 	}
 }
 
+// Covers: SIG-IPE-7351
 func TestServiceValidate(t *testing.T) {
 	ok := testService()
 	if err := ok.validate(); err != nil {
@@ -76,6 +78,7 @@ func TestServiceValidate(t *testing.T) {
 	}
 }
 
+// Covers: SIG-IPE-7351
 func TestServiceAddrPrefersLocalHost(t *testing.T) {
 	s := Service{Host: "myvtn.local", Port: 883, IPs: []net.IP{net.IPv4(192, 0, 2, 1)}}
 	if got := s.Addr(); got != "myvtn.local:883" {
@@ -87,6 +90,7 @@ func TestServiceAddrPrefersLocalHost(t *testing.T) {
 	}
 }
 
+// Covers: SIG-IPE-7351
 func TestRecordsPackParseRoundTrip(t *testing.T) {
 	r, err := newResponder(testService(), ServiceType)
 	if err != nil {
@@ -132,6 +136,7 @@ func TestRecordsPackParseRoundTrip(t *testing.T) {
 // TestParseCompressedNames reads a packet assembled byte by byte whose
 // second record's owner name and the PTR target use compression pointers
 // (RFC 1035 clause 4.1.4).
+// Covers: SIG-IPE-7351
 func TestParseCompressedNames(t *testing.T) {
 	var b []byte
 	b = append(b, 0, 0, 0x84, 0, 0, 0, 0, 2, 0, 0, 0, 0) // response, AA, 2 answers

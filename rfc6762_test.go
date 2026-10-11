@@ -24,6 +24,7 @@ import (
 // name = own name, one bitmap window) is written uncompressed and read
 // back, including a next name sent as a compression pointer; malformed
 // bitmaps are rejected.
+// Covers: SIG-IPE-7340
 func TestNSECWireForm(t *testing.T) {
 	n := rr{Name: "host.local.", Type: typeNSEC, TTL: 120, Flush: true, Types: []dnsmessage.Type{dnsmessage.TypeAAAA, dnsmessage.TypeA}}
 	// A is type 1 (bit 1 of byte 0), AAAA type 28 (bit 4 of byte 3).
@@ -90,6 +91,7 @@ func typesOf(list []rr) string {
 // for types it does not have with NSEC (RFC 6762 clause 6.1), adds the
 // NSEC as an additional record when an address family is missing, and
 // adds the other family's addresses when it has both (clause 6.2).
+// Covers: SIG-IPE-7340
 func TestResponderNSEC(t *testing.T) {
 	s := testService()
 	s.IPs = []net.IP{net.IPv4(192, 0, 2, 7)} // IPv4 only
@@ -156,6 +158,7 @@ func TestResponderNSEC(t *testing.T) {
 // or a host no AAAA record, ends the questions for them and completes the
 // instance (RFC 6762 clause 6.1); an NSEC also removes cached records of
 // types it says do not exist, if they are older than a second.
+// Covers: SIG-IPE-7340
 func TestBrowserReadsNSEC(t *testing.T) {
 	r, err := newResponder(testService(), ServiceType)
 	if err != nil {
@@ -208,6 +211,7 @@ func TestBrowserReadsNSEC(t *testing.T) {
 // on in further packets; the first holds the questions, every packet but
 // the last has the TC bit, none is over the limit and no known answer is
 // lost (RFC 6762 clause 7.2).
+// Covers: SIG-IPE-7341
 func TestPackQueryTruncated(t *testing.T) {
 	q := mustQ(t, "_openadr3._tcp.local.", dnsmessage.TypePTR, false)
 	var known []rr
@@ -280,6 +284,7 @@ func TestPackQueryTruncated(t *testing.T) {
 
 // TestPackResponseSplit: a response too long for one packet is split
 // between answers, and additional records are added while they fit.
+// Covers: SIG-IPE-7343
 func TestPackResponseSplit(t *testing.T) {
 	var ans []rr
 	for i := range 40 {
@@ -315,6 +320,7 @@ func TestPackResponseSplit(t *testing.T) {
 // with no answer for poofWindow, remove the record (RFC 6762 clause
 // 10.5). QU questions, queries listing the record and records only heard
 // in unicast replies do not count; an answer resets the count.
+// Covers: SIG-IPE-7345
 func TestPassiveObservationOfFailures(t *testing.T) {
 	r, err := newResponder(testService(), ServiceType)
 	if err != nil {
@@ -370,6 +376,7 @@ func TestPassiveObservationOfFailures(t *testing.T) {
 
 // TestReconfirmDeadline: records marked for reconfirmation are dropped at
 // the deadline unless received again (RFC 6762 clause 10.4).
+// Covers: SIG-IPE-7346
 func TestReconfirmDeadline(t *testing.T) {
 	r, err := newResponder(testService(), ServiceType)
 	if err != nil {
@@ -405,6 +412,7 @@ func TestReconfirmDeadline(t *testing.T) {
 // just asked with no known answers is not asked again (RFC 6762 clause
 // 7.3); one asked with known answers, a QU question or one asked longer
 // ago still is.
+// Covers: SIG-IPE-7347
 func TestDuplicateQuestionSuppression(t *testing.T) {
 	w := &Watcher{opts: Options{Port: 5353}, c: newCache(), asked: map[want]time.Time{}}
 	src := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 9), Port: 5353}
@@ -428,6 +436,7 @@ func TestDuplicateQuestionSuppression(t *testing.T) {
 
 // TestOnLink: the source check of RFC 6762 clause 11 accepts link-local,
 // loopback and on-subnet addresses and refuses others.
+// Covers: SIG-IPE-7348
 func TestOnLink(t *testing.T) {
 	old := hostAddrs
 	hostAddrs = func() ([]net.Addr, error) {
@@ -478,6 +487,7 @@ func TestOnLink(t *testing.T) {
 
 // TestConflictLimit: after 15 conflicts within ten seconds the next probe
 // waits five seconds (RFC 6762 clause 8.1); older conflicts do not count.
+// Covers: SIG-IPE-7344
 func TestConflictLimit(t *testing.T) {
 	a := &Announcer{}
 	now := time.Now()
@@ -498,6 +508,7 @@ func TestConflictLimit(t *testing.T) {
 
 // TestRenameSkipsSameName: an ongoing rename numbers on from the renames
 // made so far and skips a result that would keep the name.
+// Covers: SIG-IPE-7344
 func TestRenameSkipsSameName(t *testing.T) {
 	s := testService()
 	s.Instance = "Site gateway (2)"
